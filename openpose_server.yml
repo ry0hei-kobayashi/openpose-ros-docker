@@ -1,0 +1,29 @@
+version: '3'
+services:
+  openpose:
+    image: openpose-build-ros:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+     - /tmp/.X11-unix:/tmp/.X11-unix
+     - ./human_position/:/catkin_ws/src/human_position/
+    environment:
+      DISPLAY: $DISPLAY
+      XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR
+      #ROS_MASTER_URI: http://192.168.0.2:11311
+      #ROS_IP: 192.168.0.10
+      ROS_MASTER_URI: http://192.168.0.189:11311
+      ROS_IP: 192.168.0.189
+    working_dir: /catkin_ws
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    #command: nvidia-smi -l 1
+    command : python3 /catkin_ws/src/human_position/scripts/openpose_server.py
