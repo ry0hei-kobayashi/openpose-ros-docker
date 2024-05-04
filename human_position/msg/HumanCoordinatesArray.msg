@@ -1,0 +1,3 @@
+std_msgs/Header header
+int64 number_of_people
+human_position/HumanCoordinates[] human_coordinates_array

@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 # coding:UTF-8
 
-import os
-import subprocess
 import math
-import time
-import cv2
-from cv_bridge import CvBridge
-import ros_numpy
 import numpy as np
 import traceback
-from openpose import pyopenpose as op
-
-import rospy
-from sensor_msgs.msg import PointCloud2 ,Image
-from geometry_msgs.msg import PoseStamped, Pose
 
 import collections
+from openpose import pyopenpose as op
+
+import cv2
+from cv_bridge import CvBridge
+
+import rospy
+import ros_numpy
+
+from geometry_msgs.msg import Point
+from sensor_msgs.msg import PointCloud2
+from human_position.msg import HumanCoordinatesArray, HumanCoordinates, Keypoint
+
+
+### ############## ###
+### keypoints dict ###
+### ############## ###
 NOSE = 0
 NECK = 1
 RIGHT_SHOULDER = 2
@@ -62,7 +67,8 @@ class OpenposeServer():
 
         rospy.init_node('openpose_server', anonymous=True)
 
-
+        #########
+        #if you want to use some 'params' for openpose, pls add here
         params = dict()
         params["model_folder"] = "/openpose/models/"
         #params["face"] = False
@@ -73,36 +79,41 @@ class OpenposeServer():
         #params["net_resolution"] = "-1x192" #nvidia-smi 1746MB
         #params["net_resolution"] = "320x320" #nvidia-smi 2846MB
         #params["net_resolution"] = "640x640" #nvidia-smi 9182MB
-        #params["net_resolution"] = "640x640" #nvidia-smi 9182MB
-        
+        #########
+
         self.opWrapper = op.WrapperPython()
         self.opWrapper.configure(params)
         self.opWrapper.start()
-        #rospy.Subscriber('/hsrb/head_rgbd_sensor/depth_registered/rectified_points', PointCloud2, self.callback)
-        rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.callback)
 
-        self.pub = rospy.Publisher('human_coordinates', PoseStamped, queue_size=10)
-        
+        #debugging for hsrb
+        #rospy.Subscriber('/hsrb/head_rgbd_sensor/depth_registered/rectified_points', PointCloud2, self.callback)
+
+        #debugging for xtion
+        rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.callback)
+        self.pub = rospy.Publisher('human_coordinates', HumanCoordinatesArray, queue_size=10)
+
         self.bridge = CvBridge()
-        self.threed_positions = []
-        self.point = PointCloud2()
 
 
     def callback(self, data):
 
-        self.threed_positions = []
-
         pcl_data = ros_numpy.numpify(data)
         pcl2img = pcl_data['rgb'].view((np.uint8, 4))[..., [2, 1, 0]]
         bgr2rgb = cv2.cvtColor(pcl2img, cv2.COLOR_BGR2RGB)
-        people = self.process_op(bgr2rgb)
+        people = self.proc_openpose2img(bgr2rgb)
 
         if people is None:
             return
 
         try:
+
+            hca = HumanCoordinatesArray()
+            hca.header.stamp = rospy.Time.now()
+            hca.header.frame_id = data.header.frame_id
+            hca.number_of_people = len(people)
+
             for person in people:
-                key_dict = collections.OrderedDict()
+                hc = HumanCoordinates()
 
                 for key, key_name in zip(person, PARTS.keys()):
 
@@ -110,50 +121,45 @@ class OpenposeServer():
                     pix_y = int(key[1])
                     score = key[2]
 
-                    #key_dict[key_name] -> (x, y, z, score)
-                    key_dict[key_name] = pcl_data[pix_y][pix_x]
-                    #rospy.logwarn(key_dict[key_name])
+                    #PARTS[key_name]: pix_x, pix_y -> x, y, z, score
+                    PARTS[key_name] = pcl_data[pix_y][pix_x]
 
                     if not math.isnan(pcl_data[pix_y][pix_x][0]) or not math.isnan(pcl_data[pix_y][pix_x][1]) or not math.isnan(pcl_data[pix_y][pix_x][2] ):
                         x = pcl_data[pix_y][pix_x][0]
                         y = pcl_data[pix_y][pix_x][1]
                         z = pcl_data[pix_y][pix_x][2]
                         if x > -4.0 and x < 4.0 and y > -1.3 and z > 0.4 and z < 10:
-                            #if person[RIGHT_WRIST][1] == 0:
-                            #    person[RIGHT_WRIST][1] = 479
+                            kp = Keypoint()
+                            kp.name = key_name
+                            p = Point()
+                            p.x, p.y, p.z = x, y, z
+                            kp.coordinate = p
+                            kp.score = score
 
-                            #if person[LEFT_WRIST][1] == 0:
-                            #    person[LEFT_WRIST][1] = 479
-
-                            rospy.logwarn("%s, %f, %f, %f, %f", key_name, x, y, z, score)
-
-
-                            #keypoints = {}
-                            #for i, key in enumerate(PARTS.keys()):
-                            #    keypoints[key] = person[i][0], person[i][1], person[i][2]
-                            #        obj = PointStamped()
-                            #        obj.header.stamp = rospy.Time.now()
-                            #        obj.header.frame_id = data.header.frame_id
-                            #        obj.point.x, obj.point.y, obj.point.z = x, y, z                              
-                            #        self.pub.publish(obj)
-                            #        rospy.logwarn("human_coordinate: %f, %f, %f", obj.point.x ,obj.point.y, obj.point.z)
-                            #         print(self.pub.publish(obj))
-
+                            #hc is a whole body keypoints.
+                            hc.keypoints.append(kp)
                     else:
                         continue
-                break
+
+                #hca has multiple person's keypoints
+                hca.human_coordinates_array.append(hc)
+
+            rospy.loginfo(hca)
+            self.pub.publish(hca)
+            
         except IndexError:
             pass
         except:
             traceback.print_exc()
 
-    def process_op(self, image):
+
+    def proc_openpose2img(self, image):
         datum = op.Datum()
         imageToProcess = image
         datum.cvInputData = imageToProcess
         self.opWrapper.emplaceAndPop(op.VectorDatum([datum]))
         try:
-            cv2.imshow("WAVING WRIST DETECTOR BY RYOHEISOFT", datum.cvOutputData)
+            cv2.imshow("HUMAN POSE DETECTOR BY RYOHEISOFT", datum.cvOutputData)
             cv2.waitKey(1)
 
         except:
@@ -168,8 +174,6 @@ if __name__ == '__main__':
         rate = rospy.Rate(30)
 
         while not rospy.is_shutdown():
-            #rospy.sleep(1.)
-            #rospy.loginfo('Waiting for person founded.')
             rate.sleep()
     except rospy.ROSInterruptException:
         pass
