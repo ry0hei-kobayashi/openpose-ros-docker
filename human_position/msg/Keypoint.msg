@@ -1,3 +1,3 @@
 string name
-geometry_msgs/Point coordinate
+geometry_msgs/Point point
 float64 score
