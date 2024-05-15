@@ -86,12 +86,11 @@ class OpenposeServer():
         self.opWrapper.start()
 
         #debugging for hsrb
-        #rospy.Subscriber('/hsrb/head_rgbd_sensor/depth_registered/rectified_points', PointCloud2, self.callback)
+        rospy.Subscriber('/hsrb/head_rgbd_sensor/depth_registered/rectified_points', PointCloud2, self.callback)
 
         #debugging for xtion
-        rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.callback)
+        #rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.callback)
         self.pub = rospy.Publisher('human_coordinates', HumanCoordinatesArray, queue_size=10)
-
         self.bridge = CvBridge()
 
 
@@ -133,11 +132,41 @@ class OpenposeServer():
                             kp.name = key_name
                             p = Point()
                             p.x, p.y, p.z = x, y, z
-                            kp.coordinate = p
+                            # kp.coordinate = p
+                            kp.point = p
                             kp.score = score
 
                             #hc is a whole body keypoints.
                             hc.keypoints.append(kp)
+
+
+                            ###for bbox
+                            KEYPOINTS = {}
+                            for i, key in enumerate(PARTS.keys()):
+                                KEYPOINTS[key] = person[i][0], person[i][1], person[i][2]
+
+                            ###bbox###
+                            col_array = []
+                            row_array = []
+                            for i in range(len(person)):
+                               col_array.append(person[i][0]) 
+                               row_array.append(person[i][1]) 
+                            col_array = [i for i in col_array if i != 0]
+                            row_array = [i for i in row_array if i != 0]
+
+                            #hc is a person bbox.
+                            hc.x = int(max(col_array))
+                            hc.w = int(min(col_array))
+                            hc.y = int(max(row_array))
+                            hc.h = int(min(row_array))
+
+                            #print(col_max,col_min,row_max,row_min)
+                            #cv2.rectangle(bgr2rgb,(col_max,row_max),(col_min , row_min), (0,255,0),2)
+                            #img = self.bridge.cv2_to_imgmsg(bgr2rgb, encoding="bgr8")
+                            #self.detected_human_pub.publish(img)                         
+                            #cv2.imshow("WAVINGHAND DETECTED",bgr2rgb)
+                            #cv2.waitKey(50)
+
                     else:
                         continue
 
