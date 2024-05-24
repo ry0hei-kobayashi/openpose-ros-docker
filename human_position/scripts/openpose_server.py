@@ -92,6 +92,16 @@ class OpenposeServer():
         #rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.callback)
         self.pub = rospy.Publisher('human_coordinates', HumanCoordinatesArray, queue_size=10)
         self.bridge = CvBridge()
+        
+        ####################
+        # アクション認識をデフォルトで起動しないように
+        self.is_waving_hand_recogniion = True
+        # self.is_waving_hand_recogniion = rospy.get_param("~is_wavinghand_recognition", False)
+        
+        # フレーム分msgを保存しておく必要がある
+        self.frames_human_coordinates_array = []
+        self.required_frames = 3  # 蓄積するフレーム数
+        ####################
 
 
     def callback(self, data):
@@ -138,8 +148,8 @@ class OpenposeServer():
 
                             #hc is a whole body keypoints.
                             hc.keypoints.append(kp)
-
-
+                            
+                            
                             ###for bbox
                             KEYPOINTS = {}
                             for i, key in enumerate(PARTS.keys()):
@@ -159,6 +169,7 @@ class OpenposeServer():
                             hc.w = int(min(col_array))
                             hc.y = int(max(row_array))
                             hc.h = int(min(row_array))
+                            hc.waving_score = 0.0
 
                             #print(col_max,col_min,row_max,row_min)
                             #cv2.rectangle(bgr2rgb,(col_max,row_max),(col_min , row_min), (0,255,0),2)
@@ -172,10 +183,36 @@ class OpenposeServer():
 
                 #hca has multiple person's keypoints
                 hca.human_coordinates_array.append(hc)
+                
 
-            rospy.loginfo(hca)
+            # rospy.loginfo(hca)
             self.pub.publish(hca)
             
+            #########################
+            '''
+            Action Recognition
+            - 最低でも3フレーム分は回したいので msg の更新が必要不可欠
+            - 1フレーム分のwaving_th(手首の変化量)をclient側に送ってもいいが, それだと手フリ認識サーバとは言えないね
+                - 手フリ認識(フレーム分回してwaving_thを超えた回数で手振りとみなす)はclient側で書く必要がある
+                - だとしたらサーバ側にwaving_thを持ってくる意味あんまない
+                
+            -> self.frames_human_coordinates_array = [] でフレーム分msgを保存すれば使えるかも
+            '''
+            #########################
+            if self.is_waving_hand_recogniion:
+                # for i in range(self.flame_num):
+                    # hcaのmsgはフレームごとに更新されるのか？
+                    #self.run_waving_hand_recognition(self, hca) # waving_th をreturn
+                # self.run_waving_hand_recognition(self, hca) # waving_th をreturn
+                
+                self.frames_human_coordinates_array.append(hca)
+                if len(self.frames_human_coordinates_array) >= self.required_frames:
+                    self.waving_th = self.run_waving_hand_recognition(self.frames_human_coordinates_array)
+                    self.frames_human_coordinates_array = []
+                    
+                hc.waving_score = self.waving_th
+                
+            rospy.loginfo(hc)         
         except IndexError:
             pass
         except:
@@ -194,8 +231,124 @@ class OpenposeServer():
         except:
             traceback.print_exc()
         return datum.poseKeypoints
+    
+    def calculate_distance(self, keypoint_1: Point, keypoint_2: Point):
+        x = keypoint_1.x - keypoint_2.x
+        y = keypoint_1.y - keypoint_2.y
+        z = keypoint_1.z - keypoint_2.z
+        distance = math.sqrt(x**2 + y**2 + z**2)
+        return distance
+    
+    def run_waving_hand_recognition(self, frames):
+        if self.is_waving_hand_recogniion is False:
+            return
+        
+        # 手振りのしきい値のリストを作成
+        waving_th_list = []
+        
+        # 手振りのしきい値を設定
+        self.sholder_th = 0.2  # キーポイントの信頼値に関するしきい値（お客さんを探している最中に変化する）
+        self.shoulder_distance_th = 0.2
+        self.wrist_th = 0.3
+        
+        # お客さんの番号
+        self.customer_number = 0
+        # ラベル付きのお客さんの座標記録dict
+        self.coordinate_labels = {}
+        self.saved_keypoints_labels = {}
+        self.saved_keypoints = {}
+        
+        # 蓄積された全てのフレームの人間の座標データを処理
+        for frame in frames:
+            rospy.logdebug("start waving hand recognition")
+            for detect_person in frame.human_coordinates_array:
+                try:
+                    keypoints = {kpt.name:kpt for kpt in detect_person.keypoints if kpt.name in ["LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_WRIST", "RIGHT_WRIST"]}
+                    # rospy.logwarn(keypoints)
 
+                    right_shoulder = keypoints["RIGHT_SHOULDER"]
+                    left_shoulder = keypoints["LEFT_SHOULDER"]
 
+                    right_wrist = keypoints["RIGHT_WRIST"]
+                    left_wrist = keypoints["LEFT_WRIST"]
+
+                    shoulder_distance = self.calculate_distance(left_shoulder.point, right_shoulder.point)
+                    
+                    ### TODO: 信頼値が低い結果(scoreが低い，両肩が離れすぎている)ははじく
+                    if (left_shoulder.score < self.sholder_th + 0.1) or (right_shoulder.score < self.sholder_th + 0.1) or (shoulder_distance > 1.0):
+                        rospy.logdebug("shoulder____skip")
+                        continue
+                    # 手首の信頼度が低いものもはじく
+                    if (left_wrist.score < self.wrist_th + 0.1) and (right_wrist.score < self.wrist_th + 0.1):
+                        rospy.logdebug("wrist____skip")
+                        continue
+                    
+                    # 手を挙げている人を見つけるとLookON
+                    if left_shoulder.point.y > left_wrist.point.y or right_shoulder.point.y > right_wrist.point.y:
+                        
+                        # 信頼値の高い結果が得られた場合に，その人の位置を計算する
+                        self.center_point = Point(
+                            (left_shoulder.point.x + right_shoulder.point.x) / 2.0,
+                            (left_shoulder.point.y + right_shoulder.point.y) / 2.0,
+                            (left_shoulder.point.z + right_shoulder.point.z) / 2.0
+                        )
+                    
+                    # １ループ目
+                    if not self.coordinate_labels:
+                        saved_keypoints = {
+                            "left_wrist": left_wrist,
+                            "right_wrist": right_wrist
+                        }
+                        # 座標に番号を付ける
+                        #######################################################################
+                        self.coordinate_labels[self.customer_number] = self.center_point
+                        self.saved_keypoints_labels[self.customer_number] = saved_keypoints
+                        self.customer_number += 1
+                        continue
+                    # ２ループ目以降
+                    else:
+                        for key, value in self.coordinate_labels.items():
+                            # もし取得した center_pointのx座標が既に coordinate_labelsのx, z座標の±0.5m内に存在する場合、同じ人が挙手しているとみなす
+                            if value.x - 0.5 < self.center_point.x < value.x + 0.5:
+                                if value.z - 0.5 < self.center_point.z < value.z + 0.5:
+                                    ### TODO: 信頼値が低い結果(scoreが低い，両肩が離れすぎている)ははじく
+                                    # if (left_shoulder.score < self.sholder_th) or (right_shoulder.score < self.sholder_th) or (shoulder_distance > 1.0):
+                                    #     rospy.logdebug("shoulder____skip")
+                                    #     continue
+                                    # # 手首の信頼度が低いものもはじく
+                                    # if (left_wrist.score < self.wrist_th) and (right_wrist.score < self.wrist_th):
+                                    #     rospy.logdebug("wrist____skip")
+                                    #     continue
+                                    
+                                    # recoginize to waving hand
+                                    saved_keypoints = self.saved_keypoints_labels[key]
+                                    # rospy.logdebug(saved_keypoints["left_wrist"].point.x - left_wrist.point.x)
+                                    rospy.logdebug(saved_keypoints["right_wrist"].point.x - right_wrist.point.x)
+                                    print("肩の距離")
+                                    print(shoulder_distance)
+                                    print("閾値：")
+                                    print(abs(saved_keypoints["right_wrist"].point.x - right_wrist.point.x) / (shoulder_distance))
+                                    
+                                    # 左右の手振りの信頼度
+                                    self.left_waving_th = abs(saved_keypoints["left_wrist"].point.x - left_wrist.point.x) / (shoulder_distance) 
+                                    self.right_waving_hand = abs(saved_keypoints["right_wrist"].point.x - right_wrist.point.x) / (shoulder_distance)
+                                    # 左右で高い方を手振りのしきい値に設定する
+                                    self.waving_th = max(self.left_waving_th, self.right_waving_hand)
+                                    
+                                    # waving_thをリストに追加
+                                    waving_th_list.append(self.waving_th)
+                except KeyError:
+                    pass
+                except:
+                    traceback.print_exc()
+        # waving_thの平均値を計算して返す
+        if waving_th_list:
+            average_waving_th = sum(waving_th_list) / len(waving_th_list)
+        else:
+            average_waving_th = 0.0
+
+        return average_waving_th   
+                                
 if __name__ == '__main__':
     try:
         rospy.logwarn("Start Openpose Server")
